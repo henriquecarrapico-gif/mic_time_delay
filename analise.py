@@ -6,12 +6,18 @@ import os
 import csv
 
 # --------------------------------------------------
-# General Broadband Filter for Sweeps and Chirps
+# Narrow Bandpass Filter for specific targeted frequencies
 # --------------------------------------------------
-def bandpass_broad(data, fs):
-    # Filter between 300 Hz and 8000 Hz to cover the sweep and chirps
-    low = 20
-    high = 8000
+def bandpass_narrow(data, fs, target_freq):
+    # Filter tightly around the target frequency (+/- 10%)
+    low = target_freq * 0.85
+    high = target_freq * 1.15
+    # Safety checks for Nyquist
+    if high >= fs / 2:
+        high = (fs / 2) * 0.95
+    if low <= 0:
+        low = 10
+        
     nyq = 0.5 * fs
     b, a = butter(4, [low/nyq, high/nyq], btype='band')
     return filtfilt(b, a, data, axis=0)
@@ -20,23 +26,17 @@ def bandpass_broad(data, fs):
 # Delay computation with constrained lag
 # --------------------------------------------------
 def compute_delay(sig1, sig2, fs):
-    # Using method='fft' for significant speedup
     corr = correlate(sig1, sig2, mode='full', method='fft')
-
-    # Limit search to ±5 ms to cover reasonable array dimensions
-    max_lag = int(0.005 * fs)
+    max_lag = int(0.005 * fs) # ±5 ms lag limit
     center = len(corr) // 2
-
     corr_window = corr[center - max_lag : center + max_lag + 1]
     lag = np.argmax(corr_window) - max_lag
-
     return lag / fs
 
 # --------------------------------------------------
-# Event extraction (find each sound)
+# Event extraction for a specific isolated frequency band
 # --------------------------------------------------
-def extract_events(data, fs):
-    # Detect sound events based on the amplitude envelope of the first channel
+def extract_events_for_freq(data, fs):
     mono = np.abs(data[:, 0])
     
     # 50 ms smoothing window
@@ -44,38 +44,48 @@ def extract_events(data, fs):
     kernel = np.ones(window_len) / window_len
     envelope = np.convolve(mono, kernel, mode='same')
     
-    # Adaptive threshold: 10% of the maximum envelope peak
-    threshold = np.max(envelope) * 0.1
+    # Adaptive threshold: 15% of peak or 5x noise floor
+    noise_floor = np.median(envelope)
+    threshold = max(np.max(envelope) * 0.15, noise_floor * 5)
     is_active = envelope > threshold
     
-    # Find where the state changes (inactive to active and vice versa)
     edges = np.diff(is_active.astype(int))
     starts = np.where(edges == 1)[0]
     ends = np.where(edges == -1)[0]
     
-    # Handle cases where the audio starts or ends while a sound is playing
-    if is_active[0]:
-        starts = np.insert(starts, 0, 0)
-    if is_active[-1]:
-        ends = np.append(ends, len(is_active) - 1)
+    if is_active[0]: starts = np.insert(starts, 0, 0)
+    if is_active[-1]: ends = np.append(ends, len(is_active) - 1)
         
-    events = []
-    for s, e in zip(starts, ends):
-        # Combine closely spaced sounds (e.g. the rapid chirps) or keep them separated.
-        # Here we just keep any sound block longer than 50ms.
-        if (e - s) > 0.05 * fs:
-            # Expand the window slightly to capture the very beginning and end of the sound
+    # Merge gaps smaller than 300ms
+    min_gap = int(0.3 * fs)
+    merged_events = []
+    if len(starts) > 0:
+        curr_s = starts[0]
+        curr_e = ends[0]
+        for i in range(1, len(starts)):
+            if starts[i] - curr_e < min_gap:
+                curr_e = max(curr_e, ends[i])
+            else:
+                merged_events.append((curr_s, curr_e))
+                curr_s = starts[i]
+                curr_e = ends[i]
+        merged_events.append((curr_s, curr_e))
+        
+    final_events = []
+    for s, e in merged_events:
+        # Keep events longer than 100ms
+        if (e - s) > 0.1 * fs:
             s_pad = max(0, s - int(0.05 * fs))
             e_pad = min(len(data), e + int(0.05 * fs))
-            events.append((s_pad, e_pad))
+            final_events.append((s_pad, e_pad))
             
-    return events
+    return final_events
 
 # --------------------------------------------------
 # Main
 # --------------------------------------------------
 def main():
-    print("Analyzing delay between channels for each sound event...")
+    print("Frequency-Targeted Audio Analyzer")
 
     if len(sys.argv) < 2:
         print("Usage: python3 analise.py file.wav")
@@ -92,7 +102,6 @@ def main():
         print("Error: not multi-channel audio")
         return
 
-    # Proper conversion from S32_LE
     if data.dtype == np.int32:
         data = data.astype(np.float32) / 2147483648.0
     elif data.dtype == np.int16:
@@ -100,79 +109,101 @@ def main():
     else:
         data = data.astype(np.float32)
 
-    # Remove DC offset & NaN
     data -= np.mean(data, axis=0)
     data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # Filter out room noise outside the buzzer's frequency range
-    print("\nFiltering broadband sweep/chirp frequencies (300Hz - 8kHz)...")
-    filtered = bandpass_broad(data, fs)
-    filtered = np.nan_to_num(filtered)
+    num_channels = data.shape[1]
+    target_frequencies = [300, 1000, 2000, 8000]
     
-    # Find individual sounds
-    events = extract_events(filtered, fs)
-    print(f"Found {len(events)} distinct sound events in the recording.")
-
-    if not events:
-        print("No sound events found. Ensure the threshold is correct and sound was recorded.")
-        return
-
-    num_channels = filtered.shape[1]
-    
-    # Dictionary to store all delays for every pair across all events
-    pair_delays = { (i, j): [] for i in range(num_channels) for j in range(i + 1, num_channels) }
-
     csv_filename = os.path.splitext(filename)[0] + "_delays.csv"
     print(f"\nWriting detailed results to: {csv_filename}")
     
+    # Store delays to calculate final averages later
+    all_pair_delays = { (f, i, j): [] for f in target_frequencies for i in range(num_channels) for j in range(i + 1, num_channels) }
+
     with open(csv_filename, 'w', newline='') as csvfile:
         csvwriter = csv.writer(csvfile)
         
         # Write CSV Headers
-        headers = ["Event_ID", "Duration_s"]
+        headers = ["Target_Freq_Hz", "Beep_Index", "Duration_s", "Event_Avg_ms"]
         for i in range(num_channels):
             for j in range(i + 1, num_channels):
                 headers.append(f"Mic{i}_vs_Mic{j}_ms")
         csvwriter.writerow(headers)
 
-        # Analyze each sound individually
-        for idx, (start, end) in enumerate(events):
-            duration_sec = (end - start) / fs
-            print(f"\n--- Event {idx + 1} ({duration_sec:.2f}s duration) ---")
+        total_events_found = 0
+
+        for freq in target_frequencies:
+            print(f"\n=====================================")
+            print(f" Hunting for {freq} Hz Beeps ")
+            print(f"=====================================")
             
-            segment = filtered[start:end]
-            row = [idx + 1, f"{duration_sec:.4f}"]
+            filtered = bandpass_narrow(data, fs, freq)
+            filtered = np.nan_to_num(filtered)
             
+            events = extract_events_for_freq(filtered, fs)
+            print(f"Found {len(events)} valid events in this frequency band.")
+            
+            for idx, (start, end) in enumerate(events):
+                duration_sec = (end - start) / fs
+                print(f"--- Beep {idx + 1} ({duration_sec:.2f}s duration) ---")
+                
+                segment = filtered[start:end]
+                row_prefix = [freq, idx + 1, f"{duration_sec:.4f}"]
+                row_delays = []
+                event_delays_list = []
+                
+                for i in range(num_channels):
+                    for j in range(i + 1, num_channels):
+                        sig1 = segment[:, i]
+                        sig2 = segment[:, j]
+
+                        if np.std(sig1) < 1e-6 or np.std(sig2) < 1e-6:
+                            row_delays.append("NaN")
+                            continue
+
+                        delay = compute_delay(sig1, sig2, fs)
+                        delay_ms = delay * 1000
+                        all_pair_delays[(freq, i, j)].append(delay_ms)
+                        event_delays_list.append(delay_ms)
+                        row_delays.append(f"{delay_ms:.4f}")
+                        
+                if event_delays_list:
+                    row_prefix.append(f"{np.mean(event_delays_list):.4f}")
+                else:
+                    row_prefix.append("NaN")
+                    
+                csvwriter.writerow(row_prefix + row_delays)
+                total_events_found += 1
+
+        # Write overall averages and std dev at the bottom, per frequency!
+        csvwriter.writerow([])
+        csvwriter.writerow(["OVERALL SUMMARY STATISTICS"])
+        
+        for freq in target_frequencies:
+            csvwriter.writerow([])
+            avg_row = [f"{freq} Hz AVERAGE", "", "", ""]
+            std_row = [f"{freq} Hz STD_DEV", "", "", ""]
+            
+            print(f"\n--- Final Averages for {freq} Hz ---")
             for i in range(num_channels):
                 for j in range(i + 1, num_channels):
-                    sig1 = segment[:, i]
-                    sig2 = segment[:, j]
+                    delays = all_pair_delays[(freq, i, j)]
+                    if delays:
+                        avg_val = np.mean(delays)
+                        std_val = np.std(delays)
+                        avg_row.append(f"{avg_val:.4f}")
+                        std_row.append(f"{std_val:.4f}")
+                        print(f"Mic {i} vs Mic {j}: Avg = {avg_val:>7.4f} ms  (Std = {std_val:.4f} ms)")
+                    else:
+                        avg_row.append("NaN")
+                        std_row.append("NaN")
+                        
+            csvwriter.writerow(avg_row)
+            csvwriter.writerow(std_row)
 
-                    # Skip weak signals inside the segment
-                    if np.std(sig1) < 1e-6 or np.std(sig2) < 1e-6:
-                        print(f"Mic {i} vs {j}: skipped (weak signal)")
-                        row.append("NaN")
-                        continue
-
-                    delay = compute_delay(sig1, sig2, fs)
-                    pair_delays[(i, j)].append(delay)
-                    delay_ms = delay * 1000
-                    row.append(f"{delay_ms:.4f}")
-                    print(f"Mic {i} vs Mic {j}: {delay_ms:.4f} ms")
-                    
-            csvwriter.writerow(row)
-
-    # Calculate and print the final averages
-    print("\n========================================")
-    print("FINAL AVERAGED DELAYS ACROSS ALL SOUNDS")
-    print("========================================")
-    for (i, j), delays in pair_delays.items():
-        if delays:
-            avg_delay = np.mean(delays)
-            std_delay = np.std(delays)
-            print(f"Mic {i} vs Mic {j}: Average = {avg_delay * 1000:>7.4f} ms  (StdDev = {std_delay * 1000:.4f} ms)")
-        else:
-            print(f"Mic {i} vs Mic {j}: No valid delays found.")
+    print(f"\nDone! Found {total_events_found} total events across all target frequencies.")
+    print(f"Detailed results saved to {csv_filename}")
 
 if __name__ == "__main__":
     main()
