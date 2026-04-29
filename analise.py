@@ -73,8 +73,8 @@ def extract_events_for_freq(data, fs):
         
     final_events = []
     for s, e in merged_events:
-        # Keep events longer than 100ms
-        if (e - s) > 0.1 * fs:
+        # Keep events longer than 400ms (to reliably catch the 0.5s beeps)
+        if (e - s) > 0.4 * fs:
             s_pad = max(0, s - int(0.05 * fs))
             e_pad = min(len(data), e + int(0.05 * fs))
             final_events.append((s_pad, e_pad))
